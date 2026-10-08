@@ -537,6 +537,43 @@ server.tool(
 );
 
 server.tool(
+  "get_outline",
+  "Get the structural outline of an ABAP object — lists its components such as includes, " +
+  "FORM routines, local class definitions, selection screens, and events without reading the " +
+  "full source. Essential for navigating large standard SAP programs before deciding which " +
+  "includes to fetch. Pass the object's ADT URI without '/source/main', " +
+  "e.g. /sap/bc/adt/programs/programs/myprog or /sap/bc/adt/oo/classes/zcl_myclass.",
+  {
+    objectUri: z.string().describe(
+      "ADT URI of the ABAP object (no '/source/main' suffix), e.g. " +
+      "/sap/bc/adt/programs/programs/saplmm07 or /sap/bc/adt/oo/classes/cl_mm_po_outbound"
+    ),
+  },
+  async ({ objectUri }) => {
+    const xml = await adtGet(objectUri, "application/vnd.sap.adt.objectStructure.v3+xml");
+    const items = [];
+    for (const m of xml.matchAll(/<adtcore:objectReference\b([\s\S]*?)(?:<\/adtcore:objectReference>|\/>)/g)) {
+      const block = m[0];
+      const attr = (n) => (block.match(new RegExp(`adtcore:${n}="([^"]*)"`)) || [])[1] || "";
+      const name = attr("name");
+      const type = attr("type");
+      const desc = decodeXml(attr("description"));
+      const lineMatch = block.match(/adtcore:name="line"\s[^>]*adtcore:value="(\d+)"/);
+      const line = lineMatch ? lineMatch[1] : null;
+      if (name && type) items.push({ name, type, desc, line });
+    }
+    if (items.length === 0) return { content: [{ type: "text", text: xml }] };
+    const lines = items.map(i => {
+      let s = `${i.type.padEnd(12)} ${i.name}`;
+      if (i.desc) s += `  — ${i.desc}`;
+      if (i.line) s += `  (line ${i.line})`;
+      return s;
+    });
+    return { content: [{ type: "text", text: lines.join("\n") }] };
+  }
+);
+
+server.tool(
   "list_package_objects",
   "List all repository objects inside an SAP package (programs, classes, CDS views, tables, " +
   "structures, data elements, domains, function groups, and everything else in it)",
