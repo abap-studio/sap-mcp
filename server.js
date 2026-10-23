@@ -5,6 +5,7 @@ import fetch from "node-fetch";
 import https from "https";
 import path from "path";
 import { fileURLToPath } from "url";
+import { randomBytes } from "crypto";
 
 // Credentials live in sap-mcp/.env and must never be written into this file.
 // A launcher-supplied environment (e.g. the MCP config "env" block) also works;
@@ -691,6 +692,245 @@ server.tool(
     } catch(e) {
       throw new Error(`query_table failed: ${e.stack || e.message}`);
     }
+  }
+);
+
+// Run one narrowly-scoped Open SQL change through a temporary $TMP class.
+// The ADT data-preview endpoint is SELECT-only; it must never be used for DML.
+function validateRecordInput(tableName, fields, label) {
+  const table = String(tableName || "").toUpperCase();
+  if (!/^[ZY][A-Z0-9_]{1,29}$/.test(table)) {
+    throw new Error("Only customer tables beginning with Z or Y can be changed.");
+  }
+  if (!fields || typeof fields !== "object" || Array.isArray(fields)) {
+    throw new Error(`${label} must be a JSON object of field names and values.`);
+  }
+  const entries = Object.entries(fields);
+  if (!entries.length) throw new Error(`${label} must contain at least one field.`);
+  const seen = new Set();
+  for (const [field, value] of entries) {
+    if (!/^[A-Z][A-Z0-9_]{0,29}$/.test(field.toUpperCase())) {
+      throw new Error(`Invalid field name: ${field}`);
+    }
+    const normalizedField = field.toUpperCase();
+    if (normalizedField === "MANDT") {
+      throw new Error("Do not include MANDT; SAP applies client handling automatically for the active profile.");
+    }
+    if (seen.has(normalizedField)) throw new Error(`Duplicate field name after case normalization: ${field}`);
+    seen.add(normalizedField);
+    if (value === null || value === undefined || typeof value === "object") {
+      throw new Error(`Field ${field} must have a scalar string, number, or boolean value.`);
+    }
+    const text = String(value);
+    if (text.length > 250 || /[\u0000-\u001f\u007f]/.test(text)) {
+      throw new Error(`Field ${field} must be at most 250 characters and contain no control characters.`);
+    }
+  }
+  return { table, entries: entries.map(([field, value]) => [field.toUpperCase(), String(value)]) };
+}
+
+function abapSqlLiteral(value) {
+  return `'${String(value).replace(/'/g, "''")}'`;
+}
+
+function abapClassLiteral(value) {
+  // ABAP character literals escape apostrophes by doubling them.
+  return `'${String(value).replace(/'/g, "''")}'`;
+}
+
+async function runTemporaryRecordChange(table, body) {
+  assertWritable();
+  const className = `ZCL_MCP_REC_${randomBytes(5).toString("hex").toUpperCase()}`;
+  const classUri = `/sap/bc/adt/oo/classes/${className.toLowerCase()}`;
+  const host = profile().host;
+  const { token, cookies: initialCookies } = await fetchCsrfToken();
+  if (!token) throw new Error("Could not obtain a CSRF token - check credentials/profile.");
+  let cookies = initialCookies;
+  const call = async (path, { method, headers = {}, body: requestBody, accept = "*/*" }) => {
+    const res = await fetch(`${host}${path}`, {
+      method,
+      headers: {
+        ...authHeaders(accept),
+        "X-CSRF-Token": token,
+        "x-sap-adt-sessiontype": "stateful",
+        Cookie: cookies,
+        ...headers,
+      },
+      body: requestBody,
+      agent,
+    });
+    cookies = mergeCookies(cookies, res);
+    return { ok: res.ok, status: res.status, text: await res.text() };
+  };
+
+  const source =
+    `CLASS ${className} DEFINITION PUBLIC FINAL CREATE PUBLIC.\n` +
+    `  PUBLIC SECTION.\n` +
+    `    INTERFACES if_oo_adt_classrun.\n` +
+    `ENDCLASS.\n\n` +
+    `CLASS ${className} IMPLEMENTATION.\n` +
+    `  METHOD if_oo_adt_classrun~main.\n` +
+    `${body}\n` +
+    `  ENDMETHOD.\n` +
+    `ENDCLASS.`;
+  const shell =
+    `<?xml version="1.0" encoding="UTF-8"?>\n` +
+    `<class:abapClass xmlns:class="http://www.sap.com/adt/oo/classes" ` +
+    `xmlns:adtcore="http://www.sap.com/adt/core" ` +
+    `adtcore:name="${className}" adtcore:type="CLAS/OC" ` +
+    `adtcore:description="Temporary MCP table record operation" ` +
+    `adtcore:language="EN" adtcore:masterLanguage="EN" ` +
+    `class:final="true" class:visibility="public">\n` +
+    `  <adtcore:packageRef adtcore:name="$TMP"/>\n` +
+    `</class:abapClass>`;
+
+  let created = false;
+  let operationOutput = "";
+  const deleteTemporaryClass = async () => {
+    const locked = await call(`${classUri}?_action=LOCK&accessMode=MODIFY`, {
+      method: "POST",
+      accept: "application/vnd.sap.as+xml;charset=UTF-8;dataname=com.sap.adt.lock.Result",
+    });
+    if (!locked.ok) throw new Error(`Could not lock temporary class for deletion (${locked.status}): ${locked.text}`);
+    const handle = (locked.text.match(/<LOCK_HANDLE>([^<]*)<\/LOCK_HANDLE>/) || [])[1];
+    if (!handle) throw new Error(`No lock handle returned for temporary-class deletion: ${locked.text}`);
+    const removed = await call(`${classUri}?lockHandle=${encodeURIComponent(handle)}`, { method: "DELETE" });
+    if (!removed.ok) {
+      await call(`${classUri}?_action=UNLOCK&lockHandle=${encodeURIComponent(handle)}`, { method: "POST" });
+      throw new Error(`Temporary class deletion failed (${removed.status}): ${removed.text}`);
+    }
+  };
+  try {
+    const create = await call("/sap/bc/adt/oo/classes", {
+      method: "POST",
+      headers: { "Content-Type": "application/vnd.sap.adt.oo.classes.v2+xml" },
+      body: shell,
+    });
+    if (!create.ok) throw new Error(`Could not create temporary ABAP class (${create.status}): ${create.text}`);
+    created = true;
+
+    const locked = await call(`${classUri}?_action=LOCK&accessMode=MODIFY`, {
+      method: "POST",
+      accept: "application/vnd.sap.as+xml;charset=UTF-8;dataname=com.sap.adt.lock.Result",
+    });
+    if (!locked.ok) throw new Error(`Could not lock temporary ABAP class (${locked.status}): ${locked.text}`);
+    const handle = (locked.text.match(/<LOCK_HANDLE>([^<]*)<\/LOCK_HANDLE>/) || [])[1];
+    if (!handle) throw new Error(`No lock handle returned for temporary class: ${locked.text}`);
+    try {
+      const put = await call(`${classUri}/source/main?lockHandle=${encodeURIComponent(handle)}`, {
+        method: "PUT",
+        headers: { "Content-Type": "text/plain; charset=utf-8" },
+        body: source,
+      });
+      if (!put.ok) throw new Error(`Could not write temporary ABAP source (${put.status}): ${put.text}`);
+    } finally {
+      const unlocked = await call(`${classUri}?_action=UNLOCK&lockHandle=${encodeURIComponent(handle)}`, { method: "POST" });
+      if (!unlocked.ok) throw new Error(`Could not unlock temporary ABAP class (${unlocked.status}): ${unlocked.text}`);
+    }
+
+    const activated = await call("/sap/bc/adt/activation?method=activate&preauditRequests=false", {
+      method: "POST",
+      headers: { "Content-Type": "application/xml" },
+      body: `<?xml version="1.0" encoding="UTF-8"?><adtcore:objectReferences xmlns:adtcore="http://www.sap.com/adt/core"><adtcore:objectReference adtcore:uri="${classUri}" adtcore:name="${className}"/></adtcore:objectReferences>`,
+    });
+    const activationErrors = parseActivationMessages(activated.text).filter(m => /^[EAW]$/i.test(m.type));
+    if (!activated.ok || activationErrors.length) {
+      throw new Error(`Could not activate temporary ABAP class (${activated.status}): ${activationErrors.map(m => m.text).join("; ") || activated.text}`);
+    }
+
+    const run = await call(`/sap/bc/adt/oo/classrun/${className.toLowerCase()}`, {
+      method: "POST",
+      headers: { "Content-Type": "text/plain" },
+      accept: "application/vnd.sap.adt.oo.classrun.result.v1+xml",
+      body: "",
+    });
+    if (!run.ok) throw new Error(`ABAP record operation failed (${run.status}): ${run.text}`);
+    operationOutput = decodeXml(run.text.replace(/<[^>]+>/g, " ")).replace(/\s+/g, " ").trim();
+    return operationOutput || `ABAP operation completed for ${table}.`;
+  } finally {
+    if (created) {
+      try {
+        await deleteTemporaryClass();
+      } catch (cleanupError) {
+        throw new Error(
+          `${operationOutput ? `Operation result: ${operationOutput}. ` : ""}` +
+          `Temporary class ${className} could not be deleted; remove it in SAP ADT. ${cleanupError.message}`
+        );
+      }
+    }
+  }
+}
+
+server.tool(
+  "insert_table_record",
+  "Insert one record into a customer Z*/Y* table through ABAP Open SQL. Requires confirm:true and a writable SAP profile.",
+  {
+    tableName: z.string().describe("Customer table name beginning with Z or Y, e.g. ZFM_ABS_0030"),
+    values: z.record(z.string(), z.union([z.string(), z.number(), z.boolean()])).describe("Field names mapped to scalar values for the new row"),
+    confirm: z.literal(true).describe("Explicitly confirm this SAP database insert"),
+  },
+  async ({ tableName, values }) => {
+    const { table, entries } = validateRecordInput(tableName, values, "values");
+    const components = entries.map(([field, value]) => `      ${field.toLowerCase()} = ${abapClassLiteral(value)}`).join("\n");
+    const body =
+      `    TRY.\n` +
+      `      DATA(ls_record) = VALUE ${table.toLowerCase()}(\n${components}\n      ).\n` +
+      `      INSERT ${table.toLowerCase()} FROM @ls_record.\n` +
+      `      IF sy-subrc <> 0.\n` +
+      `        out->write( |INSERT FAILED; SY-SUBRC={ sy-subrc }| ).\n` +
+      `        RETURN.\n` +
+      `      ENDIF.\n` +
+      `      COMMIT WORK AND WAIT.\n` +
+      `      out->write( 'INSERTED=1' ).\n` +
+      `    CATCH cx_root INTO DATA(lx_error).\n` +
+      `      ROLLBACK WORK.\n` +
+      `      out->write( lx_error->get_text( ) ).\n` +
+      `    ENDTRY.`;
+    const result = await runTemporaryRecordChange(table, body);
+    return { content: [{ type: "text", text: result }] };
+  }
+);
+
+server.tool(
+  "update_table_record",
+  "Update exactly one record in a customer Z*/Y* table using keyFields as the WHERE condition. Requires confirm:true and a writable SAP profile.",
+  {
+    tableName: z.string().describe("Customer table name beginning with Z or Y, e.g. ZFM_ABS_0030"),
+    keyFields: z.record(z.string(), z.union([z.string(), z.number(), z.boolean()])).describe("Fields identifying exactly one row; normally the full primary key"),
+    values: z.record(z.string(), z.union([z.string(), z.number(), z.boolean()])).describe("Fields and replacement values; key fields cannot be changed"),
+    confirm: z.literal(true).describe("Explicitly confirm this SAP database update"),
+  },
+  async ({ tableName, keyFields, values }) => {
+    const { table, entries: keys } = validateRecordInput(tableName, keyFields, "keyFields");
+    const { entries: changes } = validateRecordInput(table, values, "values");
+    const keyNames = new Set(keys.map(([field]) => field));
+    if (changes.some(([field]) => keyNames.has(field))) {
+      throw new Error("values cannot change a field also supplied in keyFields.");
+    }
+    const where = keys.map(([field, value]) => `${field.toLowerCase()} = ${abapSqlLiteral(value)}`).join(" AND ");
+    const set = changes.map(([field, value]) => `${field.toLowerCase()} = ${abapSqlLiteral(value)}`).join("\n        ");
+    const body =
+      `    TRY.\n` +
+      `      SELECT COUNT( * ) FROM ${table.toLowerCase()} WHERE ${where} INTO @DATA(lv_matches).\n` +
+      `      IF lv_matches <> 1.\n` +
+      `        out->write( |UPDATE REFUSED; matched { lv_matches } rows, expected exactly 1| ).\n` +
+      `        RETURN.\n` +
+      `      ENDIF.\n` +
+      `      UPDATE ${table.toLowerCase()} SET ${set}\n` +
+      `        WHERE ${where}.\n` +
+      `      IF sy-dbcnt <> 1.\n` +
+      `        ROLLBACK WORK.\n` +
+      `        out->write( |UPDATE ROLLED BACK; changed { sy-dbcnt } rows| ).\n` +
+      `        RETURN.\n` +
+      `      ENDIF.\n` +
+      `      COMMIT WORK AND WAIT.\n` +
+      `      out->write( 'UPDATED=1' ).\n` +
+      `    CATCH cx_root INTO DATA(lx_error).\n` +
+      `      ROLLBACK WORK.\n` +
+      `      out->write( lx_error->get_text( ) ).\n` +
+      `    ENDTRY.`;
+    const result = await runTemporaryRecordChange(table, body);
+    return { content: [{ type: "text", text: result }] };
   }
 );
 
@@ -4263,6 +4503,221 @@ server.tool(
     });
     if (!res.ok) throw new Error(`BSP file PUT failed (${res.status}). ${await res.text()}`);
     return { content: [{ type: "text", text: `Patched 1 occurrence in ${bspName}/${filePath}${corrNr ? ` on ${corrNr}` : ""}. Lines ${before.split("\n").length} -> ${after.split("\n").length}. No activation needed.` }] };
+  }
+);
+
+// --- Enhancement Implementation (ENHO) ---
+// SAP uses two source-relevant subtypes with different ADT path segments:
+//   ENHO/XHH  hook implementation  → enhoxhh/{name}  has /source/main
+//   ENHO/XHB  BAdI implementation  → enhoxhb/{name}  NO /source/main;
+//             the real code lives in the implementing class (use get/update/patch_class)
+//
+// LOCKING: ENHO/XHH source physically lives inside the host object (function group,
+// program, class, etc.). SAP requires locking the HOST object, not the ENHO itself.
+// The host URI is read from the ENHO metadata (element_usage="REDO").
+
+const ENHO_SUBTYPES = {
+  xhh: { segment: "enhoxhh", type: "ENHO/XHH", label: "hook enhancement implementation" },
+  xhb: { segment: "enhoxhb", type: "ENHO/XHB", label: "BAdI enhancement implementation" },
+};
+
+function enhoUri(name, subtype = "xhh") {
+  const s = ENHO_SUBTYPES[subtype.toLowerCase()];
+  if (!s) throw new Error(`Unknown ENHO subtype "${subtype}". Use "xhh" (hook) or "xhb" (BAdI).`);
+  return `/sap/bc/adt/enhancements/${s.segment}/${name.toLowerCase()}`;
+}
+
+// Edit flow for ENHO/XHH: locks the HOST object (discovered from ENHO metadata),
+// writes source to the ENHO URI, then unlocks the host. Activation targets the ENHO.
+async function editEnhoSourceObject({ name, uri, transform, corrNr, activate, kind }) {
+  assertWritable();
+  const host = profile().host;
+  const log = [];
+
+  const { token, cookies: initialCookies } = await fetchCsrfToken();
+  let cookies = initialCookies;
+  if (!token) throw new Error("Could not obtain a CSRF token - check credentials/profile.");
+
+  const call = async (path, { method, headers = {}, body, accept = "*/*" }) => {
+    const res = await fetch(`${host}${path}`, {
+      method,
+      headers: {
+        ...authHeaders(accept),
+        "X-CSRF-Token": token,
+        "x-sap-adt-sessiontype": "stateful",
+        Cookie: cookies,
+        ...headers,
+      },
+      body,
+      agent,
+    });
+    cookies = mergeCookies(cookies, res);
+    return { ok: res.ok, status: res.status, text: await res.text() };
+  };
+
+  // 1) Fetch ENHO metadata to find the host object URI (element_usage="REDO")
+  const meta = await call(uri, { method: "GET", accept: "*/*" });
+  if (!meta.ok) throw new Error(`Cannot read ENHO metadata (${meta.status}). ${meta.text}`);
+  // The REDO entry is the host program/function group that owns the enhancement point.
+  // Match element_usage="REDO" then the nearest adtcore:uri= that follows within the same tag block.
+  const redoBlock = meta.text.match(/element_usage="REDO"([\s\S]*?)(?:<\/enhcore:referencedObject>|<enhcore:referencedObject)/);
+  const hostUri = redoBlock
+    ? (redoBlock[1].match(/adtcore:uri="([^"]*)"/) || [])[1]
+    : null;
+  if (!hostUri) throw new Error(
+    "Cannot determine host object URI from ENHO metadata. The ENHO may not have a REDO reference. " +
+    "Raw metadata snippet: " + meta.text.slice(0, 500)
+  );
+  log.push(`Host object for locking: ${hostUri}`);
+
+  // 2) Read current ENHO source
+  const probe = await call(`${uri}/source/main`, { method: "GET", accept: "text/plain" });
+  if (probe.status === 404) throw new Error(`ENHO ${name} source not found. Use create_enho to create it.`);
+  if (!probe.ok) throw new Error(`Cannot read ${name} (${probe.status}). ${probe.text}`);
+
+  const before = String(probe.text).replace(/\r\n/g, "\n");
+  const after = transform(before, log);
+  log.push(`Target: ${uri}`);
+  log.push(`Lines ${before.split("\n").length} -> ${after.split("\n").length}.`);
+
+  // 3) Lock the HOST object (ENHO direct lock is rejected by SAP with "not available in this mode")
+  const locked = await call(`${hostUri}?_action=LOCK&accessMode=MODIFY`, {
+    method: "POST",
+    accept: "application/vnd.sap.as+xml;charset=UTF-8;dataname=com.sap.adt.lock.Result",
+  });
+  if (!locked.ok) throw new Error(`Lock failed on host ${hostUri} (${locked.status}). ${locked.text}`);
+  const handle = (locked.text.match(/<LOCK_HANDLE>([^<]*)<\/LOCK_HANDLE>/) || [])[1];
+  if (!handle) throw new Error(`No lock handle returned from host lock. ${locked.text}`);
+  log.push("Locked host object.");
+
+  let wrote = false;
+  try {
+    // 4) Write ENHO source using the host lock handle
+    const put = await call(
+      `${uri}/source/main?lockHandle=${encodeURIComponent(handle)}` +
+      (corrNr ? `&corrNr=${encodeURIComponent(corrNr)}` : ""),
+      { method: "PUT", headers: { "Content-Type": "text/plain; charset=utf-8" }, body: after }
+    );
+    if (!put.ok) throw new Error(`Source PUT failed (${put.status}). ${put.text}`);
+    log.push(`Source written${corrNr ? ` on ${corrNr}` : ""}.`);
+    wrote = true;
+  } finally {
+    // 5) Unlock the HOST object
+    const unlocked = await call(`${hostUri}?_action=UNLOCK&lockHandle=${encodeURIComponent(handle)}`, {
+      method: "POST",
+    });
+    log.push(unlocked.ok ? "Unlocked host." : `WARNING: unlock failed (${unlocked.status}) - host may stay locked.`);
+  }
+
+  if (wrote && activate) await runActivation(call, uri, name, log, kind);
+  else if (wrote) log.push(`Not activated (activate=false) - activate it yourself or with activate_object.`);
+
+  return log.join("\n");
+}
+
+server.tool(
+  "get_enho_source",
+  "Read the ABAP source of a hook Enhancement Implementation (ENHO/XHH) from SAP. " +
+  "Returns the full implementation source with all ENHANCEMENT blocks. " +
+  "Only ENHO/XHH (hook) objects have a text source - for BAdI implementations (ENHO/XHB) " +
+  "read the implementing class with get_class_source instead.",
+  {
+    enhoName: z.string().describe("Enhancement implementation name, e.g. ZEH_MY_HOOK"),
+    subtype: z.enum(["xhh", "xhb"]).optional().default("xhh")
+      .describe("ENHO subtype: 'xhh' = hook (default, has source), 'xhb' = BAdI (no source - edit the implementing class)"),
+  },
+  async ({ enhoName, subtype }) => {
+    if (subtype === "xhb") {
+      return { content: [{ type: "text", text: "ENHO/XHB (BAdI implementation) has no text source/main. " +
+        "Its code lives in the implementing class. Use get_object_info with " +
+        `/sap/bc/adt/enhancements/enhoxhb/${enhoName.toLowerCase()} to find the class name, ` +
+        "then read it with get_class_source." }] };
+    }
+    const source = await adtGet(`${enhoUri(enhoName, subtype)}/source/main`, "text/plain");
+    return { content: [{ type: "text", text: source }] };
+  }
+);
+
+server.tool(
+  "create_enho",
+  "Create a new hook Enhancement Implementation (ENHO/XHH) in SAP and activate it. " +
+  "Refuses to run on production profiles. The source must contain at least one ENHANCEMENT block. " +
+  "Example: 'ENHANCEMENT 1 <enho_name>. \" code ENDENHANCEMENT.' " +
+  "For BAdI implementations (ENHO/XHB) create the implementing class instead. " +
+  "Needs a transport unless package is $TMP.",
+  {
+    enhoName: z.string().describe("Enhancement implementation name, e.g. ZEH_MY_HOOK"),
+    description: z.string().describe("Short description"),
+    packageName: z.string().describe("Package, e.g. ZABAP. Use $TMP for a local throwaway."),
+    source: z.string().describe("Complete ENHO source with ENHANCEMENT...ENDENHANCEMENT blocks"),
+    transport: z.string().optional().describe("Transport request. Omit only for $TMP."),
+    activate: z.boolean().optional().default(true).describe("Activate after writing the source"),
+  },
+  async ({ enhoName, description, packageName, source, transport: corrNr, activate }) => {
+    const name = enhoName.toUpperCase();
+    const shell =
+      `<?xml version="1.0" encoding="UTF-8"?>\n` +
+      `<enho:enhancement xmlns:enho="http://www.sap.com/adt/enhancements/enho" ` +
+      `xmlns:adtcore="http://www.sap.com/adt/core" ` +
+      `adtcore:description="${escapeXml(description)}" adtcore:name="${escapeXml(name)}" ` +
+      `adtcore:type="ENHO/XHH" adtcore:language="EN" adtcore:masterLanguage="EN">\n` +
+      `  <adtcore:packageRef adtcore:name="${escapeXml(packageName.toUpperCase())}"/>\n` +
+      `</enho:enhancement>`;
+    const text = await createSourceObject({
+      name,
+      uri: enhoUri(enhoName, "xhh"),
+      createEndpoint: "/sap/bc/adt/enhancements/enhoxhh",
+      contentType: "application/vnd.sap.adt.enho.xhh.v1+xml",
+      shell, source, corrNr, activate, kind: "hook enhancement implementation",
+    });
+    return { content: [{ type: "text", text }] };
+  }
+);
+
+server.tool(
+  "update_enho",
+  "Overwrite the source of an EXISTING hook Enhancement Implementation (ENHO/XHH). Locks, PUTs " +
+  "the whole new source, unlocks, then optionally activates. Refuses to run on production profiles. " +
+  "REPLACES the whole source - read it first with get_enho_source and send the complete result back. " +
+  "Prefer patch_enho for small edits. For BAdI implementations use update_class on the implementing class.",
+  {
+    enhoName: z.string().describe("Enhancement implementation name, e.g. ZEH_MY_HOOK"),
+    source: z.string().describe("Complete new ENHO source - REPLACES the entire implementation"),
+    transport: z.string().optional().describe("Transport request. Omit only for local/$TMP objects."),
+    activate: z.boolean().optional().default(false).describe("Activate after writing. Default false."),
+  },
+  async ({ enhoName, source, transport: corrNr, activate }) => {
+    const text = await editEnhoSourceObject({
+      name: enhoName.toUpperCase(), uri: enhoUri(enhoName, "xhh"),
+      transform: wholeSource(source), corrNr, activate,
+      kind: "hook enhancement implementation",
+    });
+    return { content: [{ type: "text", text }] };
+  }
+);
+
+server.tool(
+  "patch_enho",
+  "Modify PART of an existing hook Enhancement Implementation (ENHO/XHH) without resending the " +
+  "whole source. Reads the current source, replaces oldString with newString (must match EXACTLY " +
+  "ONCE), then locks, PUTs, unlocks, and optionally activates. Refuses to run on production profiles. " +
+  "Use this to add/change a single ENHANCEMENT block or a few lines inside one. " +
+  "For BAdI implementations use patch_class on the implementing class.",
+  {
+    enhoName: z.string().describe("Enhancement implementation name, e.g. ZEH_MY_HOOK"),
+    oldString: z.string().describe("Exact existing text to replace. Must occur exactly once - include enough context to be unique."),
+    newString: z.string().describe("Replacement text"),
+    transport: z.string().optional().describe("Transport request. Omit only for local/$TMP objects."),
+    activate: z.boolean().optional().default(false).describe("Activate after writing. Default false."),
+  },
+  async ({ enhoName, oldString, newString, transport: corrNr, activate }) => {
+    const name = enhoName.toUpperCase();
+    const text = await editEnhoSourceObject({
+      name, uri: enhoUri(enhoName, "xhh"),
+      transform: replaceOnce(oldString, newString, name), corrNr, activate,
+      kind: "hook enhancement implementation",
+    });
+    return { content: [{ type: "text", text }] };
   }
 );
 
