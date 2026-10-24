@@ -4721,5 +4721,406 @@ server.tool(
   }
 );
 
+// ─── Adobe PDF Forms (SFP transaction) ──────────────────────────────────────
+// Two object types:
+//   SFPI – Form Interface  (data binding / context / parameters)
+//   SFPF – Form Layout     (XDP / Adobe XFA layout definition)
+//
+// ADT endpoints follow the formbuilder sub-tree. Content types may need
+// adjustment depending on the exact SAP release; the values here match
+// the abap-adt-api open-source client and SAP NW 7.50+.
+
+const sfpiUri  = n => `/sap/bc/adt/formbuilder/interfaces/${n.toLowerCase()}`;
+const sfpfUri  = n => `/sap/bc/adt/formbuilder/forms/${n.toLowerCase()}`;
+const stxfUri  = n => `/sap/bc/adt/vit/wb/object_type/stxforms/object_name/${n.toUpperCase()}`;
+
+// ── get_sfpi_source ──────────────────────────────────────────────────────────
+server.tool(
+  "get_sfpi_source",
+  "Read the source XML of an Adobe Form Interface (SFPI object, SFP transaction). " +
+  "Returns the interface context XML that defines parameters, global data, and data " +
+  "bindings. Safe on any profile.",
+  { interfaceName: z.string().describe("Form interface name, e.g. ZFI_INVOICE") },
+  async ({ interfaceName }) => {
+    const source = await adtGet(`${sfpiUri(interfaceName)}/source/main`, "text/plain");
+    return { content: [{ type: "text", text: source }] };
+  }
+);
+
+// ── create_sfpi ──────────────────────────────────────────────────────────────
+server.tool(
+  "create_sfpi",
+  "Create a new Adobe Form Interface (SFPI) in SAP and write its initial context XML. " +
+  "Refuses to run on production profiles. The interface defines parameters (IMPORT/EXPORT) " +
+  "and global data available to the form layout. After creation, create the matching " +
+  "form layout with create_sfpf.",
+  {
+    interfaceName: z.string().describe("Interface name, e.g. ZFI_INVOICE (Z/Y prefix required)"),
+    description:   z.string().describe("Short description shown in SE80/SFP"),
+    package:       z.string().describe("Development package, e.g. ZFORMS"),
+    transport:     z.string().optional().describe("Transport request. Omit only for $TMP objects."),
+    source:        z.string().optional().describe(
+      "Initial interface XML. If omitted a minimal skeleton is written. " +
+      "Must be valid SFPI context XML (fb:formInterface root element)."
+    ),
+    activate:      z.boolean().optional().default(false).describe("Activate after writing. Default false."),
+  },
+  async ({ interfaceName, description, package: devclass, transport: corrNr, source, activate }) => {
+    const name = interfaceName.toUpperCase();
+    const defaultSource =
+      `<?xml version="1.0" encoding="utf-8"?>\n` +
+      `<fb:formInterface xmlns:fb="http://www.sap.com/formbulider/interface"\n` +
+      `                  xmlns:xsd="http://www.w3.org/2001/XMLSchema">\n` +
+      `  <fb:globalData>\n` +
+      `    <!-- Add parameters here, e.g.: -->\n` +
+      `    <!-- <fb:parameter name="IS_DATA" type="xsd:string" direction="IMPORT"/> -->\n` +
+      `  </fb:globalData>\n` +
+      `</fb:formInterface>`;
+    const shell =
+      `<?xml version="1.0" encoding="UTF-8"?>\n` +
+      `<sfpinterface:abapFormInterface\n` +
+      `  xmlns:sfpinterface="http://www.sap.com/adt/formbuilder/interface"\n` +
+      `  xmlns:adtcore="http://www.sap.com/adt/core"\n` +
+      `  adtcore:name="${name}"\n` +
+      `  adtcore:description="${description}"\n` +
+      `  adtcore:language="EN"\n` +
+      `  adtcore:masterLanguage="EN">\n` +
+      `  <adtcore:packageRef adtcore:name="${devclass.toUpperCase()}"/>\n` +
+      `</sfpinterface:abapFormInterface>`;
+    const text = await createSourceObject({
+      name,
+      uri: sfpiUri(name),
+      createEndpoint: "/sap/bc/adt/formbuilder/interfaces",
+      contentType: "application/vnd.sap.adt.formbuilder.interface.v1+xml",
+      shell,
+      source: source || defaultSource,
+      corrNr,
+      activate,
+      kind: "Adobe Form Interface",
+    });
+    return { content: [{ type: "text", text }] };
+  }
+);
+
+// ── update_sfpi ──────────────────────────────────────────────────────────────
+server.tool(
+  "update_sfpi",
+  "Replace the entire source of an existing Adobe Form Interface (SFPI) with new XML. " +
+  "Locks, PUTs, unlocks, and optionally activates. Refuses to run on production profiles.",
+  {
+    interfaceName: z.string().describe("Form interface name, e.g. ZFI_INVOICE"),
+    source:        z.string().describe("Complete replacement interface context XML."),
+    transport:     z.string().optional().describe("Transport request."),
+    activate:      z.boolean().optional().default(false).describe("Activate after writing."),
+  },
+  async ({ interfaceName, source, transport: corrNr, activate }) => {
+    const name = interfaceName.toUpperCase();
+    const text = await editSourceObject({
+      name, uri: sfpiUri(name),
+      transform: wholeSource(source), corrNr, activate,
+      kind: "Adobe Form Interface", createHint: "create_sfpi",
+    });
+    return { content: [{ type: "text", text }] };
+  }
+);
+
+// ── patch_sfpi ───────────────────────────────────────────────────────────────
+server.tool(
+  "patch_sfpi",
+  "Modify part of an existing Adobe Form Interface (SFPI) by replacing an exact string. " +
+  "oldString must match exactly once. Refuses to run on production profiles.",
+  {
+    interfaceName: z.string().describe("Form interface name, e.g. ZFI_INVOICE"),
+    oldString:     z.string().describe("Exact existing text to replace (must match once)."),
+    newString:     z.string().describe("Replacement text."),
+    transport:     z.string().optional().describe("Transport request."),
+    activate:      z.boolean().optional().default(false).describe("Activate after writing."),
+  },
+  async ({ interfaceName, oldString, newString, transport: corrNr, activate }) => {
+    const name = interfaceName.toUpperCase();
+    const text = await editSourceObject({
+      name, uri: sfpiUri(name),
+      transform: replaceOnce(oldString, newString, name), corrNr, activate,
+      kind: "Adobe Form Interface", createHint: "create_sfpi",
+    });
+    return { content: [{ type: "text", text }] };
+  }
+);
+
+// ── get_sfpf_source ──────────────────────────────────────────────────────────
+server.tool(
+  "get_sfpf_source",
+  "Read the XDP layout source of an Adobe Form (SFPF object, SFP transaction). " +
+  "Returns the XFA/XDP XML that defines pages, subforms, fields, and layout. " +
+  "Safe on any profile.",
+  { formName: z.string().describe("Form name, e.g. ZFP_INVOICE") },
+  async ({ formName }) => {
+    const source = await adtGet(`${sfpfUri(formName)}/source/main`, "text/plain");
+    return { content: [{ type: "text", text: source }] };
+  }
+);
+
+// ── create_sfpf ──────────────────────────────────────────────────────────────
+server.tool(
+  "create_sfpf",
+  "Create a new Adobe Form Layout (SFPF) in SAP and write its initial XDP source. " +
+  "Requires an existing Form Interface (SFPI) — create that first with create_sfpi. " +
+  "Refuses to run on production profiles. If no source is supplied, writes a minimal " +
+  "A4 XDP shell with one page and a text placeholder.",
+  {
+    formName:      z.string().describe("Form name, e.g. ZFP_INVOICE (Z/Y prefix required)"),
+    interfaceName: z.string().describe("Linked form interface name, e.g. ZFI_INVOICE"),
+    description:   z.string().describe("Short description shown in SE80/SFP"),
+    package:       z.string().describe("Development package, e.g. ZFORMS"),
+    transport:     z.string().optional().describe("Transport request. Omit only for $TMP objects."),
+    source:        z.string().optional().describe(
+      "Initial XDP layout XML. If omitted a minimal A4 skeleton is used. " +
+      "Must be valid XDP (xdp:xdp root element with template, config, datasets)."
+    ),
+    activate:      z.boolean().optional().default(false).describe("Activate after writing."),
+  },
+  async ({ formName, interfaceName, description, package: devclass, transport: corrNr, source, activate }) => {
+    const name = formName.toUpperCase();
+    const intf = interfaceName.toUpperCase();
+    const defaultSource =
+      `<?xml version="1.0" encoding="UTF-8"?>\n` +
+      `<xdp:xdp xmlns:xdp="http://ns.adobe.com/xdp/">\n` +
+      `  <template xmlns="http://www.xfa.org/schema/xfa-template/3.3/">\n` +
+      `    <subform name="form1" layout="tb" locale="en_US">\n` +
+      `      <pageSet>\n` +
+      `        <pageArea name="Page1" id="Page1">\n` +
+      `          <contentArea x="18mm" y="18mm" w="174mm" h="261mm"/>\n` +
+      `          <medium stock="default" short="210mm" long="297mm"/>\n` +
+      `        </pageArea>\n` +
+      `      </pageSet>\n` +
+      `      <subform name="Body" layout="tb" w="174mm">\n` +
+      `        <draw name="Title" w="174mm" h="12mm">\n` +
+      `          <value><text>${name}</text></value>\n` +
+      `          <font typeface="Arial" size="14pt" weight="bold"/>\n` +
+      `        </draw>\n` +
+      `      </subform>\n` +
+      `    </subform>\n` +
+      `  </template>\n` +
+      `  <config xmlns="http://www.xfa.org/schema/xci/3.1/">\n` +
+      `    <agent name="designer">\n` +
+      `      <destination>pdf</destination>\n` +
+      `      <pdf>\n` +
+      `        <version>1.7</version>\n` +
+      `        <interactive>0</interactive>\n` +
+      `      </pdf>\n` +
+      `    </agent>\n` +
+      `  </config>\n` +
+      `  <datasets xmlns="http://www.xfa.org/schema/xfa-data/1.0/"/>\n` +
+      `</xdp:xdp>`;
+    const shell =
+      `<?xml version="1.0" encoding="UTF-8"?>\n` +
+      `<sfpform:abapForm\n` +
+      `  xmlns:sfpform="http://www.sap.com/adt/formbuilder/form"\n` +
+      `  xmlns:adtcore="http://www.sap.com/adt/core"\n` +
+      `  adtcore:name="${name}"\n` +
+      `  adtcore:description="${description}"\n` +
+      `  adtcore:language="EN"\n` +
+      `  adtcore:masterLanguage="EN">\n` +
+      `  <adtcore:packageRef adtcore:name="${devclass.toUpperCase()}"/>\n` +
+      `  <sfpform:interface adtcore:name="${intf}"/>\n` +
+      `</sfpform:abapForm>`;
+    const text = await createSourceObject({
+      name,
+      uri: sfpfUri(name),
+      createEndpoint: "/sap/bc/adt/formbuilder/forms",
+      contentType: "application/vnd.sap.adt.formbuilder.form.v1+xml",
+      shell,
+      source: source || defaultSource,
+      corrNr,
+      activate,
+      kind: "Adobe Form Layout",
+    });
+    return { content: [{ type: "text", text }] };
+  }
+);
+
+// ── update_sfpf ──────────────────────────────────────────────────────────────
+server.tool(
+  "update_sfpf",
+  "Replace the entire XDP layout source of an existing Adobe Form (SFPF). " +
+  "Locks, PUTs, unlocks, and optionally activates. Refuses to run on production profiles.",
+  {
+    formName:  z.string().describe("Form name, e.g. ZFP_INVOICE"),
+    source:    z.string().describe("Complete replacement XDP layout XML."),
+    transport: z.string().optional().describe("Transport request."),
+    activate:  z.boolean().optional().default(false).describe("Activate after writing."),
+  },
+  async ({ formName, source, transport: corrNr, activate }) => {
+    const name = formName.toUpperCase();
+    const text = await editSourceObject({
+      name, uri: sfpfUri(name),
+      transform: wholeSource(source), corrNr, activate,
+      kind: "Adobe Form Layout", createHint: "create_sfpf",
+    });
+    return { content: [{ type: "text", text }] };
+  }
+);
+
+// ── patch_sfpf ───────────────────────────────────────────────────────────────
+server.tool(
+  "patch_sfpf",
+  "Modify part of an existing Adobe Form Layout (SFPF) by replacing an exact string in the XDP. " +
+  "oldString must match exactly once. Use to add fields, change text, or update bindings " +
+  "without resending the entire XDP. Refuses to run on production profiles.",
+  {
+    formName:  z.string().describe("Form name, e.g. ZFP_INVOICE"),
+    oldString: z.string().describe("Exact existing XDP text to replace (must match once)."),
+    newString: z.string().describe("Replacement XDP text."),
+    transport: z.string().optional().describe("Transport request."),
+    activate:  z.boolean().optional().default(false).describe("Activate after writing."),
+  },
+  async ({ formName, oldString, newString, transport: corrNr, activate }) => {
+    const name = formName.toUpperCase();
+    const text = await editSourceObject({
+      name, uri: sfpfUri(name),
+      transform: replaceOnce(oldString, newString, name), corrNr, activate,
+      kind: "Adobe Form Layout", createHint: "create_sfpf",
+    });
+    return { content: [{ type: "text", text }] };
+  }
+);
+
+// ─── Smartforms (SE71 / STXFORMS) ───────────────────────────────────────────
+// Smartforms are accessed via the ADT VIT (Visual Integration Tool) endpoint.
+// The source is a complex proprietary XML. Read is reliable; create/update
+// require the full Smartform XML which SAP validates strictly.
+
+// ── get_smartform_source ─────────────────────────────────────────────────────
+server.tool(
+  "get_smartform_source",
+  "Read the XML source of an existing SAP Smartform (STXFORMS object, SE71 transaction). " +
+  "Returns the full Smartform definition XML including form attributes, pages, windows, " +
+  "text nodes, and graphic nodes. Safe on any profile.",
+  { smartformName: z.string().describe("Smartform name, e.g. ZSF_INVOICE") },
+  async ({ smartformName }) => {
+    const source = await adtGet(`${stxfUri(smartformName)}/source/main`, "text/plain");
+    return { content: [{ type: "text", text: source }] };
+  }
+);
+
+// ── create_smartform ─────────────────────────────────────────────────────────
+server.tool(
+  "create_smartform",
+  "Create a new Smartform (STXFORMS) in SAP with an initial XML definition. " +
+  "Refuses to run on production profiles. If no source is supplied a minimal " +
+  "single-page shell is written. The Smartform XML must include the root " +
+  "SMARTFORMS element with FORMATTRIB, PAGES, and WINDOWS sections.",
+  {
+    smartformName: z.string().describe("Smartform name, e.g. ZSF_INVOICE (Z/Y prefix required)"),
+    description:   z.string().describe("Short description shown in SE71"),
+    package:       z.string().describe("Development package, e.g. ZFORMS"),
+    transport:     z.string().optional().describe("Transport request. Omit only for $TMP objects."),
+    source:        z.string().optional().describe(
+      "Full Smartform XML. If omitted a minimal shell is written. " +
+      "Must be valid STXFORMS XML with SMARTFORMS root element."
+    ),
+    activate:      z.boolean().optional().default(false).describe("Activate after writing."),
+  },
+  async ({ smartformName, description, package: devclass, transport: corrNr, source, activate }) => {
+    const name = smartformName.toUpperCase();
+    const defaultSource =
+      `<?xml version="1.0" encoding="UTF-8"?>\n` +
+      `<SMARTFORMS>\n` +
+      `  <FORMATTRIB>\n` +
+      `    <TDFORM>${name}</TDFORM>\n` +
+      `    <TDFTYPE>S</TDFTYPE>\n` +
+      `    <TDDESCR>${description}</TDDESCR>\n` +
+      `    <TDPARAM></TDPARAM>\n` +
+      `  </FORMATTRIB>\n` +
+      `  <PAGES>\n` +
+      `    <PAGE>\n` +
+      `      <PAGENAME>PAGE1</PAGENAME>\n` +
+      `      <PAGEDESCR>Page 1</PAGEDESCR>\n` +
+      `      <RTYPE>MAIN</RTYPE>\n` +
+      `      <PFORMAT>DINA4</PFORMAT>\n` +
+      `      <WINDOWS>\n` +
+      `        <WINDOW>\n` +
+      `          <WDWNAME>MAIN</WDWNAME>\n` +
+      `          <WDWTYPE>MAIN</WDWTYPE>\n` +
+      `          <TDTOP>10MM</TDTOP>\n` +
+      `          <TDLEFT>10MM</TDLEFT>\n` +
+      `          <TDWIDTH>190MM</TDWIDTH>\n` +
+      `          <TDHEIGHT>270MM</TDHEIGHT>\n` +
+      `        </WINDOW>\n` +
+      `      </WINDOWS>\n` +
+      `    </PAGE>\n` +
+      `  </PAGES>\n` +
+      `</SMARTFORMS>`;
+    const shell =
+      `<?xml version="1.0" encoding="UTF-8"?>\n` +
+      `<vit:abapSmartform\n` +
+      `  xmlns:vit="http://www.sap.com/adt/vit"\n` +
+      `  xmlns:adtcore="http://www.sap.com/adt/core"\n` +
+      `  adtcore:name="${name}"\n` +
+      `  adtcore:description="${description}"\n` +
+      `  adtcore:language="EN"\n` +
+      `  adtcore:masterLanguage="EN">\n` +
+      `  <adtcore:packageRef adtcore:name="${devclass.toUpperCase()}"/>\n` +
+      `</vit:abapSmartform>`;
+    const text = await createSourceObject({
+      name,
+      uri: stxfUri(name),
+      createEndpoint: "/sap/bc/adt/vit/wb/object_type/stxforms",
+      contentType: "application/vnd.sap.adt.vit.stxforms.v1+xml",
+      shell,
+      source: source || defaultSource,
+      corrNr,
+      activate,
+      kind: "Smartform",
+    });
+    return { content: [{ type: "text", text }] };
+  }
+);
+
+// ── update_smartform ─────────────────────────────────────────────────────────
+server.tool(
+  "update_smartform",
+  "Replace the entire XML source of an existing Smartform (STXFORMS). " +
+  "Locks, PUTs, unlocks, and optionally activates. Refuses to run on production profiles.",
+  {
+    smartformName: z.string().describe("Smartform name, e.g. ZSF_INVOICE"),
+    source:        z.string().describe("Complete replacement Smartform XML."),
+    transport:     z.string().optional().describe("Transport request."),
+    activate:      z.boolean().optional().default(false).describe("Activate after writing."),
+  },
+  async ({ smartformName, source, transport: corrNr, activate }) => {
+    const name = smartformName.toUpperCase();
+    const text = await editSourceObject({
+      name, uri: stxfUri(name),
+      transform: wholeSource(source), corrNr, activate,
+      kind: "Smartform", createHint: "create_smartform",
+    });
+    return { content: [{ type: "text", text }] };
+  }
+);
+
+// ── patch_smartform ──────────────────────────────────────────────────────────
+server.tool(
+  "patch_smartform",
+  "Modify part of an existing Smartform (STXFORMS) by replacing an exact string in its XML. " +
+  "oldString must match exactly once. Refuses to run on production profiles.",
+  {
+    smartformName: z.string().describe("Smartform name, e.g. ZSF_INVOICE"),
+    oldString:     z.string().describe("Exact existing XML text to replace (must match once)."),
+    newString:     z.string().describe("Replacement XML text."),
+    transport:     z.string().optional().describe("Transport request."),
+    activate:      z.boolean().optional().default(false).describe("Activate after writing."),
+  },
+  async ({ smartformName, oldString, newString, transport: corrNr, activate }) => {
+    const name = smartformName.toUpperCase();
+    const text = await editSourceObject({
+      name, uri: stxfUri(name),
+      transform: replaceOnce(oldString, newString, name), corrNr, activate,
+      kind: "Smartform", createHint: "create_smartform",
+    });
+    return { content: [{ type: "text", text }] };
+  }
+);
+
 const transport = new StdioServerTransport();
 await server.connect(transport);
