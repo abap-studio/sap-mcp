@@ -3339,6 +3339,116 @@ server.tool(
 );
 
 server.tool(
+  "get_selection_texts",
+  "Read the raw SELECTION TEXTS (the labels shown next to PARAMETERS and SELECT-OPTIONS on the selection screen) " +
+  "for an existing ABAP program or function group. This is a separate ADT sub-resource from text symbols " +
+  "(get_text_elements) - the two must be written independently. Returns line-based NAME=Label pairs as ADT " +
+  "stores them. Read-only, safe on any profile including production.",
+  {
+    objectName: z.string().describe("Program or function group name, e.g. ZRM_STOCK_MOVEMENT_HK"),
+    objectType: z.enum(["PROG", "FUGR"]).optional().default("PROG").describe("Object kind. Default PROG (report/include)."),
+  },
+  async ({ objectName, objectType }) => {
+    const name = objectName.toUpperCase();
+    const uri = textElementsUri(objectType, name);
+    const mediaType = "application/vnd.sap.adt.textelements.selections.v1";
+    let text;
+    try {
+      text = await adtGet(`${uri}/source/selections`, mediaType);
+    } catch (err) {
+      if (/SAP ADT error 404/.test(String(err && err.message))) {
+        return { content: [{ type: "text", text: `${name} has no selection texts (or does not exist).` }] };
+      }
+      throw err;
+    }
+    return { content: [{ type: "text", text: text && text.trim() ? text : `${name} has no selection texts.` }] };
+  }
+);
+
+server.tool(
+  "patch_selection_texts",
+  "Add or update SELECTION TEXTS (the labels shown next to PARAMETERS / SELECT-OPTIONS on the selection screen) " +
+  "for an existing ABAP program or function group. This is a SEPARATE ADT sub-resource from text symbols " +
+  "(patch_text_elements) - the two cannot be written in one call. Reads the current selection texts, merges in " +
+  "the given ones (matched by parameter/select-option name, case-insensitive; existing entry is overwritten, new " +
+  "one is added), then writes the merged result back. Existing entries not mentioned are left untouched. " +
+  "No activation needed - selection texts take effect immediately once saved. Refuses to run on production profiles.",
+  {
+    objectName: z.string().describe("Program or function group name, e.g. ZRM_STOCK_MOVEMENT_HK"),
+    objectType: z.enum(["PROG", "FUGR"]).optional().default("PROG").describe("Object kind. Default PROG."),
+    selections: z.array(z.object({
+      name: z.string().describe("PARAMETERS or SELECT-OPTIONS field name (up to 8 chars), e.g. P_BUKRS or S_MATNR"),
+      text: z.string().describe("The label text to display on the selection screen"),
+    })).min(1).describe("Selection text entries to add or update"),
+    transport: z.string().optional().describe("Transport request number, e.g. DEVK900123. Omit for $TMP objects."),
+  },
+  async ({ objectName, objectType, selections, transport: corrNr }) => {
+    assertWritable();
+    const name = objectName.toUpperCase();
+    const uri = textElementsUri(objectType, name);
+    const log = [`patch_selection_texts for ${name}:`];
+    const host = profile().host;
+
+    const { token, cookies: initialCookies } = await fetchCsrfToken();
+    let cookies = initialCookies;
+    if (!token) throw new Error("Could not obtain a CSRF token - check credentials/profile.");
+
+    const call = async (path, { method, headers = {}, body, accept = "*/*" }) => {
+      const res = await fetch(`${host}${path}`, {
+        method,
+        headers: { ...authHeaders(accept), "X-CSRF-Token": token, "x-sap-adt-sessiontype": "stateful", Cookie: cookies, ...headers },
+        body, agent,
+      });
+      cookies = mergeCookies(cookies, res);
+      return { ok: res.ok, status: res.status, text: await res.text() };
+    };
+
+    const mediaType = "application/vnd.sap.adt.textelements.selections.v1";
+
+    // 1) read current selection texts (404 = none yet - not an error)
+    const probe = await call(`${uri}/source/selections`, { method: "GET", accept: mediaType });
+    if (!probe.ok && probe.status !== 404) throw new Error(`Cannot read selection texts for ${name} (${probe.status}). ${probe.text}`);
+    const before = probe.ok ? parseTextElements(probe.text) : [];
+
+    // 2) merge - overwrite by name (case-insensitive), append new entries
+    const byName = new Map(before.map(el => [el.id.toUpperCase(), el]));
+    for (const s of selections) {
+      const key = s.name.toUpperCase();
+      if (key.length > 8) throw new Error(`Selection name "${s.name}" exceeds 8 characters.`);
+      byName.set(key, { id: key, text: s.text });
+    }
+    const merged = [...byName.values()];
+    log.push(`${before.length} existing selection text(s), ${selections.length} upserted -> ${merged.length} total.`);
+
+    // 3) lock the text elements resource
+    const locked = await call(`${uri}?_action=LOCK&accessMode=MODIFY`, {
+      method: "POST",
+      accept: "application/vnd.sap.as+xml;charset=UTF-8;dataname=com.sap.adt.lock.Result",
+    });
+    if (!locked.ok) throw new Error(`Lock failed (${locked.status}). ${locked.text}`);
+    const handle = (locked.text.match(/<LOCK_HANDLE>([^<]*)<\/LOCK_HANDLE>/) || [])[1];
+    if (!handle) throw new Error(`No lock handle returned. ${locked.text}`);
+    log.push("Locked.");
+
+    try {
+      const body = merged.map(el => `${el.id}=${el.text}`).join("\n") + "\n";
+      const put = await call(
+        `${uri}/source/selections?lockHandle=${encodeURIComponent(handle)}` +
+        (corrNr ? `&corrNr=${encodeURIComponent(corrNr)}` : ""),
+        { method: "PUT", headers: { "Content-Type": `${mediaType}; charset=UTF-8`, Accept: mediaType }, body }
+      );
+      if (!put.ok) throw new Error(`Selection texts PUT failed (${put.status}). ${put.text}`);
+      log.push(`Selection texts written${corrNr ? ` on ${corrNr}` : ""}. No activation needed.`);
+    } finally {
+      const unlocked = await call(`${uri}?_action=UNLOCK&lockHandle=${encodeURIComponent(handle)}`, { method: "POST" });
+      log.push(unlocked.ok ? "Unlocked." : `WARNING: unlock failed (${unlocked.status}) - object may stay locked.`);
+    }
+
+    return { content: [{ type: "text", text: log.join("\n") }] };
+  }
+);
+
+server.tool(
   "update_table",
   "Overwrite the source (field definitions) of an EXISTING DDIC database table. Locks, PUTs the whole new DDL " +
   "source, unlocks, then optionally activates. Refuses to run on production profiles. IMPORTANT: this REPLACES " +
