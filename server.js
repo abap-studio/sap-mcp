@@ -1834,6 +1834,19 @@ server.tool(
 const ddlxUri = n => `/sap/bc/adt/ddic/ddlx/sources/${n.toLowerCase()}`;
 
 server.tool(
+  "get_ddlx_source",
+  "Read the source of an existing CDS metadata extension (DDLX) from SAP. " +
+  "Use this before update_ddlx or patch_ddlx to see what is already there. Read-only, safe on any profile.",
+  {
+    ddlxName: z.string().describe("Metadata extension name, e.g. ZGCDS_ME_PP_R003"),
+  },
+  async ({ ddlxName }) => {
+    const source = await adtGet(`${ddlxUri(ddlxName)}/source/main`, "text/plain");
+    return { content: [{ type: "text", text: source }] };
+  }
+);
+
+server.tool(
   "create_ddlx",
   "Create a new CDS metadata extension (DDLX) - the object that carries UI annotations for a CDS view, which a " +
   "Fiori Elements app needs. Refuses to run on production profiles. Source looks like: " +
