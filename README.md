@@ -2,20 +2,6 @@
 
 MCP server for SAP S/4HANA via the ADT API. Runs locally over stdio.
 
-## Local PDF Encryptor
-
-This repository also includes a separate local browser tool for password-protecting PDFs. It lists folders and PDF files on this computer and saves an AES-256 encrypted copy beside the selected original.
-
-Requirements: Node.js 20.12+ and an internet connection the first time the encryption engine loads. The PDF encryption engine runs as WebAssembly in the browser, so qpdf does not need to be installed on Windows.
-
-Start the tool:
-
-```bash
-npm run pdf-encryptor
-```
-
-On Windows PowerShell, use `npm.cmd run pdf-encryptor` if the `npm` command is blocked by the script execution policy. Keep that terminal open while using the app. Open the URL printed in the terminal (normally `http://127.0.0.1:4177`), use **Browse…** to choose a folder or enter its path, and select a PDF. The PDF is encrypted in the browser and the output is saved beside the original as `<original>_encrypted.pdf`; existing output files are never overwritten. The server listens only on the local computer. If the default port is already in use, it automatically tries the next port. Set `PDF_ENCRYPTOR_PORT` to choose a starting port.
-
 ## Setup on a new machine
 
 **Prerequisites** (install these first):
