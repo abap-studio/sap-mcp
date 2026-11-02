@@ -13,19 +13,38 @@ MCP server for SAP S/4HANA via the ADT API. Runs locally over stdio.
   (To install on Windows: `winget install --id Git.Git -e`, then **reopen your
   terminal**. macOS: `brew install git`. Verify with `git --version`.)
 
-Then:
+Then, open a terminal, navigate to the folder where you want to keep sap-mcp
+(we recommend your home directory), and clone:
+
+| OS | Recommended location | Command to get there |
+|---|---|---|
+| Windows | `C:\Users\<your-name>\sap-mcp` | `cd %USERPROFILE%` |
+| macOS / Linux | `~/sap-mcp` | `cd ~` |
 
 ```bash
+# Windows (PowerShell or Command Prompt) — clone into your home folder:
+cd $env:USERPROFILE
 git clone https://github.com/abap-studio/sap-mcp.git
 cd sap-mcp
+
+# macOS / Linux — clone into your home folder:
+cd ~
+git clone https://github.com/abap-studio/sap-mcp.git
+cd sap-mcp
+```
+
+After cloning, continue:
+
+```bash
 npm install
 cp .env.example .env      # PowerShell/CMD: copy .env.example .env
 ```
 
 > **No git?** Instead of `git clone`, download the repo from GitHub: green
-> **Code** button -> **Download ZIP**, unzip it, then `cd` into the folder and
-> continue from `npm install`. (git is only nicer later, for pulling updates
-> with `git pull` instead of re-downloading.)
+> **Code** button -> **Download ZIP**, unzip it into your home folder
+> (so the result is `C:\Users\<name>\sap-mcp` on Windows or `~/sap-mcp`
+> on Mac/Linux), then `cd` into the folder and continue from `npm install`.
+> (git is only nicer later, for pulling updates with `git pull`.)
 
 Now **edit `.env`** and fill in the real `HOST`/`CLIENT` for each system plus
 **your own** SAP `USER`/`PASS`. The real hostnames are intentionally not in this
