@@ -3624,6 +3624,24 @@ server.tool(
 );
 
 server.tool(
+  "get_function_module_source",
+  "Read the source of an existing ABAP function module. Use this before update_function_module or " +
+  "patch_function_module to see what is already there. Pass the function group WITHOUT the SAPL prefix " +
+  "(e.g. ZFOO, not SAPLZFOO). Read-only, safe on any profile including production.",
+  {
+    functionGroup: z.string().describe("Function group WITHOUT the SAPL prefix, e.g. ZABLMM_QCF_WF. Tip: look up PNAME in TFDIR - SAPL<GROUP> means group <GROUP>."),
+    functionModule: z.string().describe("Function module name, e.g. ZABLMM_QCF_WF_APPROVE"),
+  },
+  async ({ functionGroup, functionModule }) => {
+    const grp = functionGroup.replace(/^SAPL/i, "").toLowerCase();
+    const fm = functionModule.toLowerCase();
+    const uri = `/sap/bc/adt/functions/groups/${grp}/fmodules/${fm}/source/main`;
+    const source = await adtGet(uri, "text/plain");
+    return { content: [{ type: "text", text: source }] };
+  }
+);
+
+server.tool(
   "create_function_group",
   "Create a new function group (the container that holds function modules). Refuses to run on production " +
   "profiles. Add modules afterwards with create_function_module. Needs a transport unless package is $TMP.",
