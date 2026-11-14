@@ -76,11 +76,10 @@ let activeProfile = PROFILES.ABLD ? "ABLD" : Object.keys(PROFILES)[0] || "ABLD";
 //   1. this built-in list (matched case-insensitively), and
 //   2. SAP_<KEY>_READONLY=true / SAP_<KEY>_PROD=true in .env.
 // They are ADDITIVE on purpose: a missing .env flag can never silently unblock
-// a system that was protected before. PRD is blocked by name as a default
-// safety net for anyone following the DEV/QAS/PRD convention from
-// .env.example - name your production profile something else if you want
-// its write protection to depend solely on the .env flag.
-const WRITE_BLOCKED_PROFILES = new Set(["PRD"]);
+// a system that was protected before. PRD/ABLP/ABLQ are blocked by name as
+// a default safety net. Name your production or QA profile something else if
+// you want its write protection to depend solely on the .env flag.
+const WRITE_BLOCKED_PROFILES = new Set(["PRD", "ABLP", "ABLQ"]);
 function isWriteBlocked(key) {
   const k = String(key || "").toUpperCase();
   if (WRITE_BLOCKED_PROFILES.has(k)) return true;
@@ -5287,12 +5286,19 @@ if (httpPort) {
         return;
       }
     }
-    // Collect body for POST requests
+    // Collect and parse body for POST requests.
+    // StreamableHTTPServerTransport.handleRequest expects a parsed JSON value
+    // (or undefined for GET/DELETE), not a raw Buffer.
     const chunks = [];
     req.on("data", c => chunks.push(c));
     req.on("end", async () => {
-      const body = Buffer.concat(chunks);
-      await transport.handleRequest(req, res, body);
+      const raw = Buffer.concat(chunks);
+      let parsed;
+      if (raw.length) {
+        try { parsed = JSON.parse(raw.toString("utf8")); }
+        catch { res.writeHead(400, { "Content-Type": "application/json" }); res.end(JSON.stringify({ error: "Invalid JSON" })); return; }
+      }
+      await transport.handleRequest(req, res, parsed);
     });
   });
 
