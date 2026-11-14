@@ -1,8 +1,10 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
+import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { z } from "zod";
 import fetch from "node-fetch";
 import https from "https";
+import http from "http";
 import path from "path";
 import { fileURLToPath } from "url";
 import { randomBytes } from "crypto";
@@ -5263,5 +5265,42 @@ server.tool(
   }
 );
 
-const transport = new StdioServerTransport();
-await server.connect(transport);
+// ── Transport selection ───────────────────────────────────────────────────────
+// Default: stdio (Claude Code, any MCP client that launches via stdio).
+// Set MCP_HTTP_PORT in .env (or environment) to start Streamable HTTP instead,
+// which is required for Microsoft Copilot Cowork and other HTTP-based clients.
+// Set MCP_HTTP_TOKEN to require Bearer-token authentication on every request.
+const httpPort = parseInt(process.env.MCP_HTTP_PORT || "0", 10);
+
+if (httpPort) {
+  const token = (process.env.MCP_HTTP_TOKEN || "").trim();
+  const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined });
+  await server.connect(transport);
+
+  const httpServer = http.createServer(async (req, res) => {
+    // Bearer-token authentication
+    if (token) {
+      const auth = (req.headers["authorization"] || "").trim();
+      if (auth !== `Bearer ${token}`) {
+        res.writeHead(401, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: "Unauthorized" }));
+        return;
+      }
+    }
+    // Collect body for POST requests
+    const chunks = [];
+    req.on("data", c => chunks.push(c));
+    req.on("end", async () => {
+      const body = Buffer.concat(chunks);
+      await transport.handleRequest(req, res, body);
+    });
+  });
+
+  httpServer.listen(httpPort, "127.0.0.1", () => {
+    console.error(`sap-mcp HTTP transport listening on http://127.0.0.1:${httpPort}/`);
+    if (!token) console.error("WARNING: MCP_HTTP_TOKEN is not set — endpoint is unauthenticated.");
+  });
+} else {
+  const transport = new StdioServerTransport();
+  await server.connect(transport);
+}

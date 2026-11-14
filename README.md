@@ -143,6 +143,45 @@ must fully quit and restart Claude Code after updating** (see the note above).
 - **Production write-block widened** — writes are now blocked on both `ABLP`
   (production) and `ABLQ` (QAS). Read access still works on every profile.
 
+## Streamable HTTP transport (Microsoft Copilot Cowork)
+
+By default sap-mcp runs over **stdio** — the mode used by Claude Code and ABAP
+Studio. If you need to connect a client that requires **Streamable HTTP** (such
+as Microsoft Copilot Cowork), set two environment variables in `.env` before
+starting the server:
+
+```bash
+MCP_HTTP_PORT=3100
+MCP_HTTP_TOKEN="change-me-to-a-long-random-secret"
+```
+
+When `MCP_HTTP_PORT` is set the server binds to `http://127.0.0.1:<port>/` and
+requires every request to carry `Authorization: Bearer <token>`. Stdio mode is
+used automatically when the variable is absent or `0`.
+
+> **Security note:** The server binds to `127.0.0.1` (localhost) only — it
+> is not reachable from other machines. To expose it externally (e.g. to
+> Microsoft Copilot Cowork in the cloud) you need a tunnel such as
+> [devtunnel](https://learn.microsoft.com/azure/developer/dev-tunnels/overview):
+>
+> ```bash
+> devtunnel host --port 3100
+> ```
+>
+> Always set a strong, random `MCP_HTTP_TOKEN` before tunnelling.
+
+### Connecting Copilot Cowork
+
+1. Add the variables above to your `.env` and start the server:
+   ```bash
+   npm run start-http
+   ```
+2. Create a tunnel and copy the public URL (e.g.
+   `https://abc123.devtunnels.ms/`).
+3. In Copilot Cowork, add an MCP server with:
+   - **URL**: `<tunnel-url>`
+   - **Authentication**: Bearer token → paste your `MCP_HTTP_TOKEN` value
+
 ## Testing your install
 
 The `node test.mjs` / `node test.mjs --live` steps above are the self-check
